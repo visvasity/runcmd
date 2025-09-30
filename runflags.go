@@ -1,8 +1,8 @@
-// Copyright (c) 2025 Visvasity LLC
+// Copyright (c) 2025 Visvasity LC
 
-// Package runcmd implements a run command helper that handles data directory,
-// logs, background, restart and self-monitor flags. Long running daemons can
-// use this functionality without duplicating the necessary logic.
+// Package runcmd handles the logic for command-line flags --data-dir,
+// --background, --restart, --self-monitor, etc. so that, other subcommands can
+// reuse this functionality without duplication.
 package runcmd
 
 import (
@@ -37,8 +37,10 @@ type RunFlags struct {
 	// LogName (-logname) holds the name prefix for the log files. Defaults to
 	// the base name of the executable.
 	LogName string
-	// LogToStderr (-logtostderr) when true redirects log output to stderr for
-	// all processes including the background ones.
+
+	// LogToStderr (-logtostderr) when true redirects logs to the standard stderr
+	// (including the background processes). Logs are NOT written to the files in
+	// the logs directory.
 	LogToStderr bool
 
 	// Restart (-restart) when true, sends shutdown request to service instance
@@ -85,7 +87,6 @@ func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
 	if v.main == nil {
 		return fmt.Errorf("runcmd.RunFlags are not configured with WithRunFunc")
 	}
-
 	log.SetFlags(log.Lshortfile | log.Lmicroseconds)
 
 	ctx, cancel := context.WithCancelCause(ctx)
@@ -99,6 +100,11 @@ func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
 	go func() {
 		cancel(fmt.Errorf("received signal %s", <-signalCh))
 	}()
+
+	binaryPath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("failed to lookup binary: %w", err)
+	}
 
 	if v.DataDir == "" {
 		v.DataDir = os.TempDir()
@@ -145,7 +151,7 @@ func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
 			defer closef()
 			slog.Info("daemon socket file is acquired/created successfully", "socket", daemonSock)
 
-			cmd, err := v.daemonize(ctx)
+			cmd, err := v.daemonize(ctx, binaryPath, os.Args[1:])
 			if err != nil {
 				return fmt.Errorf("could not start background process: %w", err)
 			}
@@ -156,7 +162,6 @@ func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
 			slog.Info("background process is initialized successfully")
 			return nil // End of the foreground process.
 		}
-
 		// Only the background process continues further.
 	}
 
@@ -164,20 +169,9 @@ func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
 	monitorLock := unixlock.New(monitorSock)
 	if !v.SelfMonitor {
 		// Stop monitor process if any.
-		closef, err := monitorLock.TryLock(ctx)
-		if err != nil {
-			if !v.Restart {
-				slog.Info("monitor socket file already exists and restart flag is false", "socket", monitorSock, "err", err)
-				return fmt.Errorf("another monitor that is not an ancestor is active (restart flag is false): %w", err)
-			}
-			slog.Info("requesting existing monitor to stop with a shutdown message", "socket", monitorSock)
-			closef, err = monitorLock.Lock(ctx, true)
-			if err != nil {
-				return fmt.Errorf("could not acquire monitor lock with shutdown message: %w", err)
-			}
-			slog.Info("stopped existing monitor with shutdown message", "socket", monitorSock)
+		if err := v.stopMonitor(ctx, monitorLock); err != nil {
+			return err
 		}
-		closef()
 	}
 	if v.SelfMonitor {
 		defer func() {
@@ -198,7 +192,7 @@ func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
 				}
 				slog.Info("acquired monitor socket lock through a shutdown message", "socket", monitorSock)
 			} else {
-				slog.Info("becoming a child cause ancestor process is the active monitor")
+				slog.Info("assuming/becoming child cause ancestor process is the active monitor")
 			}
 		}
 
@@ -211,22 +205,16 @@ func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
 				return err
 			}
 
-			binaryPath, err := os.Executable()
-			if err != nil {
-				return fmt.Errorf("failed to lookup binary: %w", err)
-			}
-
 			for i := 0; ctx.Err() == nil; i++ {
 				if err := v.monitorChild(ctx, i, monitorLock, daemonLock, binaryPath, os.Args[1:]); err != nil {
 					slog.Warn("monitored child process died", "instance", i, "err", err)
 					time.Sleep(50*time.Millisecond + time.Duration(rand.Intn(100))*time.Millisecond)
 					continue
 				}
-				return nil
+				return nil // First child instance could not initialize.
 			}
 			return context.Cause(ctx) // End of the monitor process.
 		}
-
 		// Only the monitored process continues further.
 	}
 
@@ -286,12 +274,7 @@ func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
 	return nil
 }
 
-func (v *RunFlags) daemonize(ctx context.Context) (*exec.Cmd, error) {
-	binaryPath, err := os.Executable()
-	if err != nil {
-		return nil, fmt.Errorf("failed to lookup binary: %w", err)
-	}
-
+func (v *RunFlags) daemonize(ctx context.Context, binPath string, args []string) (*exec.Cmd, error) {
 	file, err := os.OpenFile("/dev/null", os.O_RDWR, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open /dev/null: %w", err)
@@ -299,8 +282,8 @@ func (v *RunFlags) daemonize(ctx context.Context) (*exec.Cmd, error) {
 	defer file.Close()
 
 	cmd := &exec.Cmd{
-		Path: binaryPath,
-		Args: os.Args,
+		Path: binPath,
+		Args: append([]string{binPath}, args...),
 		Dir:  "/",
 		Env: []string{
 			fmt.Sprintf("PATH=%s", os.Getenv("PATH")),
@@ -315,7 +298,7 @@ func (v *RunFlags) daemonize(ctx context.Context) (*exec.Cmd, error) {
 		},
 	}
 	if v.LogToStderr {
-		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		cmd.Stderr = os.Stderr
 	}
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("failed to start process: %w", err)
@@ -338,6 +321,25 @@ func waitForReport(ctx context.Context, m *unixlock.Mutex, cmd *exec.Cmd) (statu
 	return unixlock.WaitForReport(ctx, m)
 }
 
+func (v *RunFlags) stopMonitor(ctx context.Context, monitorLock *unixlock.Mutex) error {
+	// Stop monitor process if any.
+	closef, err := monitorLock.TryLock(ctx)
+	if err != nil {
+		if !v.Restart {
+			slog.Info("monitor socket file already exists and restart flag is false", "socket", monitorLock.SocketPath(), "err", err)
+			return fmt.Errorf("another monitor that is not an ancestor is active (restart flag is false): %w", err)
+		}
+		slog.Info("requesting existing monitor to stop with a shutdown message", "socket", monitorLock.SocketPath())
+		closef, err = monitorLock.Lock(ctx, true)
+		if err != nil {
+			return fmt.Errorf("could not acquire monitor lock with shutdown message: %w", err)
+		}
+		slog.Info("stopped existing monitor with shutdown message", "socket", monitorLock.SocketPath())
+	}
+	closef()
+	return nil
+}
+
 func (v *RunFlags) monitorChild(ctx context.Context, instance int, monitorLock, daemonLock *unixlock.Mutex, binPath string, args []string) (status error) {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(status)
@@ -345,7 +347,7 @@ func (v *RunFlags) monitorChild(ctx context.Context, instance int, monitorLock, 
 	slog.Info("starting a monitored child process", "instance", instance)
 	cmd := exec.CommandContext(ctx, binPath, args...)
 	if v.LogToStderr {
-		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+		cmd.Stderr = os.Stderr
 	}
 	if err := cmd.Start(); err != nil {
 		slog.Error("child process command has failed (will retry)", "instance", instance, "err", err)
@@ -375,17 +377,19 @@ func (v *RunFlags) monitorChild(ctx context.Context, instance int, monitorLock, 
 		// Send monitor logs to a different file -- only after first instance
 		// is successful and background flag is set.
 		if v.Background {
-			// opts := &sglog.Options{
-			// 	Name:                 v.LogName + "-monitor",
-			// 	LogFileHeader:        true,
-			// 	LogDirs:              []string{v.LogDir},
-			// 	LogFileMaxSize:       100 * 1024 * 1024,
-			// 	LogFileReuseDuration: time.Hour,
-			// }
-			// backend := sglog.NewBackend(opts)
-			// defer backend.Close()
-			// slog.Info("self-monitoring logs are written to the logs directory", "logname", opts.Name, "logdir", v.LogDir)
-			// slog.SetDefault(slog.New(backend.Handler()))
+			if !v.LogToStderr {
+				opts := &sglog.Options{
+					Name:                 v.LogName + "-monitor",
+					LogFileHeader:        true,
+					LogDirs:              []string{v.LogDir},
+					LogFileMaxSize:       100 * 1024 * 1024,
+					LogFileReuseDuration: time.Hour,
+				}
+				backend := sglog.NewBackend(opts)
+				defer backend.Close()
+				slog.Info("self-monitoring logs are written to the logs directory", "logname", opts.Name, "logdir", v.LogDir)
+				slog.SetDefault(slog.New(backend.Handler()))
+			}
 		}
 	}
 

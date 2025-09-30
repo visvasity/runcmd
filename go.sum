@@ -8,3 +8,5 @@ github.com/visvasity/unixlock v0.0.0-20250815183951-1465eae4030e h1:jCi26Wj9nUkH
 github.com/visvasity/unixlock v0.0.0-20250815183951-1465eae4030e/go.mod h1:iK/xTQDtcPcZO6Iyzwfr6xuFrrcfp4atG6jgYk2HBtU=
 github.com/visvasity/unixlock v0.0.0-20250930062010-b9f628952473 h1:JBi5b4ZTgeTGIy6nCwypQbdXJbB+vOIqBwyqr+Sweg8=
 github.com/visvasity/unixlock v0.0.0-20250930062010-b9f628952473/go.mod h1:iK/xTQDtcPcZO6Iyzwfr6xuFrrcfp4atG6jgYk2HBtU=
+github.com/visvasity/unixlock v0.0.0-20250930160023-4211ac5b542a h1:S8cacWQwX/tWynMePysYSIjhUDGsbxIbeH8bEvGjHHk=
+github.com/visvasity/unixlock v0.0.0-20250930160023-4211ac5b542a/go.mod h1:iK/xTQDtcPcZO6Iyzwfr6xuFrrcfp4atG6jgYk2HBtU=

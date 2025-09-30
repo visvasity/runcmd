@@ -1,0 +1,10 @@
+github.com/mitchellh/go-ps v1.0.0 h1:i6ampVEEF4wQFF+bkYfwYgY+F/uYJDktmvLPf7qIgjc=
+github.com/mitchellh/go-ps v1.0.0/go.mod h1:J4lOc8z8yJs6vUwklHw2XEIiT4z4C40KtWVN3nvg8Pg=
+github.com/visvasity/cli v0.0.0-20250729021438-02a4793adfad h1:qC4yIrwF7GYfYfRBUVZhJebzJEHTQrHysgmbNG5s/LU=
+github.com/visvasity/cli v0.0.0-20250729021438-02a4793adfad/go.mod h1:ILMwbw7ura6UQfgCh3IIKnXBa267vHTBP/qNn6gAnYA=
+github.com/visvasity/sglog v0.0.0-20250729151519-230bd74d3ef0 h1:rKJxIcjA+CGeyVu5vEwaCPw+NRxi+tYDW77Wndd+B1w=
+github.com/visvasity/sglog v0.0.0-20250729151519-230bd74d3ef0/go.mod h1:tbXJl3NRnZVv5ArHRSZeLW1nGJTofo3MxWTFBPQxcRM=
+github.com/visvasity/unixlock v0.0.0-20250815183951-1465eae4030e h1:jCi26Wj9nUkH1i4v14Tm6who9HrcO8XTAusLS4APuTc=
+github.com/visvasity/unixlock v0.0.0-20250815183951-1465eae4030e/go.mod h1:iK/xTQDtcPcZO6Iyzwfr6xuFrrcfp4atG6jgYk2HBtU=
+github.com/visvasity/unixlock v0.0.0-20250930062010-b9f628952473 h1:JBi5b4ZTgeTGIy6nCwypQbdXJbB+vOIqBwyqr+Sweg8=
+github.com/visvasity/unixlock v0.0.0-20250930062010-b9f628952473/go.mod h1:iK/xTQDtcPcZO6Iyzwfr6xuFrrcfp4atG6jgYk2HBtU=

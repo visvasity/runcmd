@@ -70,7 +70,7 @@ func (v *RunFlags) WithRunFunc(f cli.CmdFunc) cli.CmdFunc {
 	return v.run
 }
 
-// FlagSet returns the flags handled by the run cmd helper.
+// FlagSet allocates a new flag.FlagSet object and configures it with the run flags.
 func (v *RunFlags) FlagSet() *flag.FlagSet {
 	fset := new(flag.FlagSet)
 	fset.BoolVar(&v.Restart, "restart", v.Restart, "When true, shutdowns existing service.")
@@ -81,6 +81,14 @@ func (v *RunFlags) FlagSet() *flag.FlagSet {
 	fset.StringVar(&v.LogName, "logname", v.LogName, "File name prefix for the log files.")
 	fset.BoolVar(&v.LogToStderr, "logtostderr", v.LogToStderr, "When true, redirect logs to stderr.")
 	return fset
+}
+
+// LogDirectory returns the preferred logs directory for the current DataDir value.
+func (v *RunFlags) LogDirectory() string {
+	if v.DataDir == "" {
+		return filepath.Join("/tmp")
+	}
+	return filepath.Join(v.DataDir, "logs")
 }
 
 func (v *RunFlags) run(ctx context.Context, args []string) (status error) {

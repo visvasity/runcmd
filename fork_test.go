@@ -32,7 +32,7 @@ func makeCommand(t *testing.T, args ...string) *exec.Cmd {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srcPath := filepath.Join(wd, "examples/example.go")
+	srcPath := filepath.Join(wd, "testdata/runcmd-tester.go")
 	if _, err := os.Stat(srcPath); err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func (v *ForkTest) Close() {
 
 func (v *ForkTest) kill(ctx context.Context, t *testing.T, pattern string) error {
 	if len(pattern) == 0 {
-		pattern = "/example"
+		pattern = "/runcmd-tester"
 	}
 	pids, err := findProcesses(t, pattern)
 	if err != nil {

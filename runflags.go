@@ -1,8 +1,8 @@
 // Copyright (c) 2025 Visvasity LC
 
 // Package runcmd handles the logic for command-line flags --data-dir,
-// --background, --restart, --self-monitor, etc. so that, other subcommands can
-// reuse this functionality without duplication.
+// --background, --restart, --self-monitor, and logging so that, different
+// daemons can reuse this functionality without duplication.
 package runcmd
 
 import (
@@ -31,16 +31,17 @@ type RunFlags struct {
 	// os.TempDir.
 	DataDir string
 
-	// LogDir (-logdir) holds the directory for the log files. Defaults to
-	// subdirectory named "logs" inside the data directory.
-	LogDir string
-	// LogName (-logname) holds the name prefix for the log files. Defaults to
-	// the base name of the executable.
-	LogName string
+	// LogOptions allows for customizing logging. By default, logs are written to
+	// stderr when -background=false and redirected to files when
+	// -background=true.
+	LogOptions sglog.Options
 
-	// LogToStderr (-logtostderr) when true redirects logs to the standard stderr
-	// (including the background processes) and logs are NOT written to the files
-	// in the logs directory.
+	// LogDir (-log-dir) holds the preferred directory for log files. Defaults to
+	// a subdirectory named "logs" inside the data directory.
+	LogDir string
+
+	// LogToStderr (-log-to-stderr) when true forces logs to the standard stderr
+	// (including when -background=true) and logs are NOT written to any files.
 	LogToStderr bool
 
 	// Restart (-restart) when true, sends shutdown request to service instance
@@ -77,18 +78,13 @@ func (v *RunFlags) FlagSet() *flag.FlagSet {
 	fset.BoolVar(&v.Background, "background", v.Background, "When true, runs as a background daemon.")
 	fset.BoolVar(&v.SelfMonitor, "self-monitor", v.SelfMonitor, "When true, auto restarts background service.")
 	fset.StringVar(&v.DataDir, "data-dir", v.DataDir, "Data directory.")
-	fset.StringVar(&v.LogDir, "logdir", v.LogDir, "Directory for log files.")
-	fset.StringVar(&v.LogName, "logname", v.LogName, "File name prefix for the log files.")
-	fset.BoolVar(&v.LogToStderr, "logtostderr", v.LogToStderr, "When true, redirect logs to stderr.")
+	fset.StringVar(&v.LogDir, "log-dir", v.LogDir, "Directory for log files.")
+	fset.BoolVar(&v.LogToStderr, "log-to-stderr", v.LogToStderr, "When true, writes logs to stderr.")
 	return fset
 }
 
-// LogDirectory returns the preferred logs directory for the current DataDir value.
-func (v *RunFlags) LogDirectory() string {
-	if v.DataDir == "" {
-		return filepath.Join("/tmp")
-	}
-	return filepath.Join(v.DataDir, "logs")
+func (v *RunFlags) isLogEnabled() bool {
+	return v.Background && !v.LogToStderr
 }
 
 func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
@@ -126,19 +122,27 @@ func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
 		}
 	}
 
-	if v.LogName == "" {
-		v.LogName = filepath.Base(binaryPath)
-	}
-
-	if v.LogDir == "" {
-		v.LogDir = filepath.Join(v.DataDir, "logs")
-	}
-	if _, err := os.Stat(v.LogDir); err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("could not stat logs dir %q: %w", v.LogDir, err)
+	// Default logging options.
+	if v.isLogEnabled() {
+		if v.LogOptions.Name == "" {
+			v.LogOptions.Name = filepath.Base(binaryPath)
 		}
-		if err := os.MkdirAll(v.LogDir, os.FileMode(0700)); err != nil {
-			return fmt.Errorf("could not create logs dir %q: %w", v.LogDir, err)
+		if len(v.LogOptions.LogDirs) == 0 || v.LogDir != "" {
+			logDir := filepath.Join(v.DataDir, "logs")
+			if v.LogDir != "" {
+				logDir = v.LogDir
+			}
+			if stat, err := os.Stat(logDir); err != nil {
+				if !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("could not stat logs dir %q: %w", logDir, err)
+				}
+				if err := os.MkdirAll(logDir, os.FileMode(0700)); err != nil {
+					return fmt.Errorf("could not create logs dir %q: %w", logDir, err)
+				}
+			} else if !stat.IsDir() {
+				return fmt.Errorf("log directory value %q is not a directory", logDir)
+			}
+			v.LogOptions.LogDirs = append([]string{logDir}, v.LogOptions.LogDirs...)
 		}
 	}
 
@@ -180,17 +184,10 @@ func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
 	}
 
 	// Redirect logging if we are NOT running in the foreground.
-	if v.Background && !v.LogToStderr {
-		opts := &sglog.Options{
-			Name:                 v.LogName,
-			LogFileHeader:        true,
-			LogDirs:              []string{v.LogDir},
-			LogFileMaxSize:       100 * 1024 * 1024,
-			LogFileReuseDuration: time.Hour,
-		}
-		backend := sglog.NewBackend(opts)
+	if v.isLogEnabled() {
+		backend := sglog.NewBackend(&v.LogOptions)
 		defer backend.Close()
-		slog.Info("service logs are written to the logs directory", "logname", opts.Name, "logdir", v.LogDir)
+		slog.Info("service logs are written to the logs directory", "log-name", v.LogOptions.Name, "log-dirs", v.LogOptions.LogDirs)
 		slog.SetDefault(slog.New(backend.Handler()))
 	}
 
@@ -363,16 +360,11 @@ func (v *RunFlags) handleSelfMonitorFlag(ctx context.Context, backgroundLock, mo
 
 	// Redirect logging if we are NOT running in the foreground.
 	if v.Background && !v.LogToStderr {
-		opts := &sglog.Options{
-			Name:                 v.LogName + "-monitor",
-			LogFileHeader:        true,
-			LogDirs:              []string{v.LogDir},
-			LogFileMaxSize:       100 * 1024 * 1024,
-			LogFileReuseDuration: time.Hour,
-		}
-		backend := sglog.NewBackend(opts)
+		opts := v.LogOptions
+		opts.Name += "-monitor"
+		backend := sglog.NewBackend(&opts)
 		defer backend.Close()
-		slog.Info("self-monitoring logs are written to the logs directory", "logname", opts.Name, "logdir", v.LogDir)
+		slog.Info("self-monitoring logs are written to the logs directory", "log-name", opts.Name, "log-dirs", v.LogOptions.LogDirs)
 		slog.SetDefault(slog.New(backend.Handler()))
 	}
 

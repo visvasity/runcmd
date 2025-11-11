@@ -39,8 +39,8 @@ type RunFlags struct {
 	LogName string
 
 	// LogToStderr (-logtostderr) when true redirects logs to the standard stderr
-	// (including the background processes). Logs are NOT written to the files in
-	// the logs directory.
+	// (including the background processes) and logs are NOT written to the files
+	// in the logs directory.
 	LogToStderr bool
 
 	// Restart (-restart) when true, sends shutdown request to service instance
@@ -126,6 +126,10 @@ func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
 		}
 	}
 
+	if v.LogName == "" {
+		v.LogName = filepath.Base(binaryPath)
+	}
+
 	if v.LogDir == "" {
 		v.LogDir = filepath.Join(v.DataDir, "logs")
 	}
@@ -138,96 +142,23 @@ func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
 		}
 	}
 
-	daemonSock := filepath.Join(v.DataDir, "daemon.sock")
-	daemonLock := unixlock.New(daemonSock)
-	if v.Background {
-		defer func() {
-			unixlock.Report(ctx, daemonLock, status)
-		}()
-
-		// Acquire exclusive ownership on the daemon lock file. Daemon lock file is
-		// expected to be held only for short duration, so restart flag is ignored.
-		closef, err := daemonLock.TryLock(ctx)
-		if err != nil {
-			if err := daemonLock.CheckAncestor(ctx); err != nil {
-				return fmt.Errorf("could not acquire lock on the daemon lock file: %w", err)
-			}
-			// Background process continues.
-		}
-		if closef != nil {
-			// Foreground process.
-			defer closef()
-			slog.Info("daemon socket file is acquired/created successfully", "socket", daemonSock)
-
-			cmd, err := v.daemonize(ctx, binaryPath, os.Args[1:])
-			if err != nil {
-				return fmt.Errorf("could not start background process: %w", err)
-			}
-			if err := waitForReport(ctx, daemonLock, cmd); err != nil {
-				slog.Error("could not initialize background process", "err", err)
-				return fmt.Errorf("background process died with status: %w", err)
-			}
-			slog.Info("background process is initialized successfully")
-			return nil // End of the foreground process.
-		}
-		// Only the background process continues further.
+	backgroundSock := filepath.Join(v.DataDir, "daemon.sock")
+	backgroundLock := unixlock.New(backgroundSock)
+	if quit, status := v.handleBackgroundFlag(ctx, backgroundLock, binaryPath); quit {
+		return status
 	}
+	defer func() { unixlock.Report(ctx, backgroundLock, status) }()
 
 	monitorSock := filepath.Join(v.DataDir, "monitor.sock")
 	monitorLock := unixlock.New(monitorSock)
-	if !v.SelfMonitor {
-		// Stop monitor process if any.
-		if err := v.stopMonitor(ctx, monitorLock); err != nil {
-			return err
-		}
+	if quit, status := v.handleSelfMonitorFlag(ctx, backgroundLock, monitorLock, binaryPath); quit {
+		return status
 	}
-	if v.SelfMonitor {
-		defer func() {
-			unixlock.Report(ctx, monitorLock, status)
-		}()
-
-		// Acquire exclusive ownership on the monitor lock file.
-		closef, err := monitorLock.TryLock(ctx)
-		if err != nil {
-			if err := monitorLock.CheckAncestor(ctx); err != nil {
-				if !v.Restart {
-					return fmt.Errorf("another monitor that is not an ancestor is active (restart flag is false): %w", err)
-				}
-				slog.Info("requesting existing monitor to stop with a shutdown message", "socket", monitorSock)
-				closef, err = monitorLock.Lock(ctx, true)
-				if err != nil {
-					return fmt.Errorf("could not acquire monitor lock with shutdown message: %w", err)
-				}
-				slog.Info("acquired monitor socket lock through a shutdown message", "socket", monitorSock)
-			} else {
-				slog.Info("assuming/becoming child cause ancestor process is the active monitor")
-			}
-		}
-
-		if closef != nil {
-			// Monitoring process. Lock file is released only when the shutdown request is received.
-			defer closef()
-
-			ctx, err := unixlock.WithLock(ctx, monitorLock)
-			if err != nil {
-				return err
-			}
-
-			for i := 0; ctx.Err() == nil; i++ {
-				if err := v.monitorChild(ctx, i, monitorLock, daemonLock, binaryPath, os.Args[1:]); err != nil {
-					slog.Warn("monitored child process died", "instance", i, "err", err)
-					time.Sleep(50*time.Millisecond + time.Duration(rand.Intn(100))*time.Millisecond)
-					continue
-				}
-				return nil // First child instance could not initialize.
-			}
-			return context.Cause(ctx) // End of the monitor process.
-		}
-		// Only the monitored process continues further.
-	}
+	defer func() { unixlock.Report(ctx, monitorLock, status) }()
 
 	serviceSock := filepath.Join(v.DataDir, "service.sock")
 	serviceLock := unixlock.New(serviceSock)
+
 	closef, err := serviceLock.TryLock(ctx)
 	if err != nil {
 		if !v.Restart {
@@ -248,8 +179,8 @@ func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
 		return err
 	}
 
-	// Initialize the logging backend.
-	if !v.LogToStderr {
+	// Redirect logging if we are NOT running in the foreground.
+	if v.Background && !v.LogToStderr {
 		opts := &sglog.Options{
 			Name:                 v.LogName,
 			LogFileHeader:        true,
@@ -268,7 +199,7 @@ func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
 		if v.SelfMonitor {
 			unixlock.Report(ctx, monitorLock, status)
 		} else if v.Background {
-			unixlock.Report(ctx, daemonLock, status)
+			unixlock.Report(ctx, backgroundLock, status)
 		}
 		v.reportf = nil
 	}
@@ -282,125 +213,233 @@ func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
 	return nil
 }
 
-func (v *RunFlags) daemonize(ctx context.Context, binPath string, args []string) (*exec.Cmd, error) {
+func (v *RunFlags) handleBackgroundFlag(ctx context.Context, backgroundLock *unixlock.Mutex, binPath string) (quit bool, status error) {
+	// If the process is started with -background flag, user wants the initial
+	// process to (1) start/restart/self-monitor the service in the background
+	// and (2) exit quickly with success or failure of the service startup.
+
+	background := v.Background
+	if len(os.Getenv("RUNCMD_DISABLE_BACKGROUND_FLAG")) != 0 {
+		background = false
+	}
+	if !background {
+		return false, nil
+	}
+
+	closef, err := backgroundLock.Lock(ctx, false /* shutdown */)
+	if err != nil {
+		return true, fmt.Errorf("could not acquire lock on the daemonize lock file: %w", err)
+	}
+	defer closef()
+
+	slog.Info("daemonize lock file is acquired/created successfully", "socket", backgroundLock.SocketPath())
+
+	// Disable the -background flag for the forked-child instance and all it's
+	// descendants.
+	os.Setenv("RUNCMD_DISABLE_BACKGROUND_FLAG", "1")
+
 	file, err := os.OpenFile("/dev/null", os.O_RDWR, 0)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open /dev/null: %w", err)
+		return true, fmt.Errorf("failed to open /dev/null: %w", err)
 	}
 	defer file.Close()
 
-	cmd := &exec.Cmd{
-		Path: binPath,
-		Args: append([]string{binPath}, args...),
-		Dir:  "/",
-		Env: []string{
-			fmt.Sprintf("PATH=%s", os.Getenv("PATH")),
-			fmt.Sprintf("USER=%s", os.Getenv("USER")),
-			fmt.Sprintf("HOME=%s", os.Getenv("HOME")),
-		},
-		Stdin:  file,
-		Stdout: file,
-		Stderr: file,
-		SysProcAttr: &syscall.SysProcAttr{
-			Setsid: true,
-		},
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer func() { cancel(status) }()
+
+	cmd := exec.Command(binPath, os.Args[1:]...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = file, file, file
+	cmd.Dir = "/"
+	cmd.Env = []string{
+		fmt.Sprintf("PATH=%s", os.Getenv("PATH")),
+		fmt.Sprintf("USER=%s", os.Getenv("USER")),
+		fmt.Sprintf("HOME=%s", os.Getenv("HOME")),
+		fmt.Sprintf("RUNCMD_DISABLE_SELFMONITOR_FLAG=%s", os.Getenv("RUNCMD_DISABLE_SELFMONITOR_FLAG")),
+		fmt.Sprintf("RUNCMD_DISABLE_BACKGROUND_FLAG=%s", os.Getenv("RUNCMD_DISABLE_BACKGROUND_FLAG")),
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid: true,
 	}
 	if v.LogToStderr {
 		cmd.Stderr = os.Stderr
 	}
+
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("failed to start process: %w", err)
+		slog.Error("could not start background process", "err", err)
+		return true, err
 	}
-	return cmd, nil
-}
-
-func waitForReport(ctx context.Context, m *unixlock.Mutex, cmd *exec.Cmd) (status error) {
-	ctx, cancel := context.WithCancelCause(ctx)
-	defer cancel(status)
-
-	if cmd != nil {
-		go func() {
-			childStatus := cmd.Wait()
-			slog.Info("child process has died", "status", childStatus)
-			cancel(childStatus)
-		}()
-	}
-
-	return unixlock.WaitForReport(ctx, m)
-}
-
-func (v *RunFlags) stopMonitor(ctx context.Context, monitorLock *unixlock.Mutex) error {
-	// Stop monitor process if any.
-	closef, err := monitorLock.TryLock(ctx)
-	if err != nil {
-		if !v.Restart {
-			slog.Info("monitor socket file already exists and restart flag is false", "socket", monitorLock.SocketPath(), "err", err)
-			return fmt.Errorf("another monitor that is not an ancestor is active (restart flag is false): %w", err)
-		}
-		slog.Info("requesting existing monitor to stop with a shutdown message", "socket", monitorLock.SocketPath())
-		closef, err = monitorLock.Lock(ctx, true)
-		if err != nil {
-			return fmt.Errorf("could not acquire monitor lock with shutdown message: %w", err)
-		}
-		slog.Info("stopped existing monitor with shutdown message", "socket", monitorLock.SocketPath())
-	}
-	closef()
-	return nil
-}
-
-func (v *RunFlags) monitorChild(ctx context.Context, instance int, monitorLock, daemonLock *unixlock.Mutex, binPath string, args []string) (status error) {
-	ctx, cancel := context.WithCancelCause(ctx)
-	defer cancel(status)
-
-	slog.Info("starting a monitored child process", "instance", instance)
-	cmd := exec.CommandContext(ctx, binPath, args...)
-	if v.LogToStderr {
-		cmd.Stderr = os.Stderr
-	}
-	if err := cmd.Start(); err != nil {
-		slog.Error("child process command has failed (will retry)", "instance", instance, "err", err)
-		return err
-	}
+	slog.Info("started new background process", "pid", cmd.Process.Pid)
 
 	v.wg.Add(1)
 	go func() {
 		childStatus := cmd.Wait()
-		slog.Info("child process has died", "status", childStatus)
+		slog.Info("background process has died", "pid", cmd.Process.Pid, "status", childStatus)
 		cancel(childStatus)
 		v.wg.Done()
 	}()
 
-	if instance == 0 {
-		status := unixlock.WaitForReport(ctx, monitorLock)
-		slog.Info("received status report from monitored child process", "instance", instance, "status", status)
+	status = unixlock.WaitForReport(ctx, backgroundLock)
+	if status == nil {
+		slog.Info("background process is initialized successfully", "pid", cmd.Process.Pid)
+	} else {
+		slog.Info("background process has failed to initialize", "pid", cmd.Process.Pid, "status", status)
+	}
 
-		if v.Background {
-			unixlock.Report(ctx, daemonLock, status)
-			slog.Info("relayed monitored child's status report to foreground process", "instance", instance)
+	return true, status // End of the foreground process.
+}
+
+func (v *RunFlags) handleSelfMonitorFlag(ctx context.Context, backgroundLock, monitorLock *unixlock.Mutex, binPath string) (quit bool, status error) {
+	selfMonitor := v.SelfMonitor
+	if len(os.Getenv("RUNCMD_DISABLE_SELFMONITOR_FLAG")) != 0 {
+		selfMonitor = false
+	}
+
+	// If there is another self-monitor instance running, we should not proceed
+	// independently if we are or are-not self-monitoring. So a successful return
+	// indicates either no-other self-monitor active or self-monitor is active
+	// for overselves.
+
+	// When current process has no -self-monitor flag and there is another
+	// self-monitor instance running, we should stop the other instance based on
+	// the restart flag. Otherwise, we may end up with racing against the other
+	// monitor repeatedly fail trying to start a new service and filling up the
+	// logs.
+
+	if !selfMonitor && !v.Restart {
+		// Ensure that no self-monitored instance is running.
+		if closef, err := monitorLock.TryLock(ctx); err == nil {
+			closef()
+			return false, nil
 		}
+		if err := monitorLock.CheckAncestor(ctx); err != nil {
+			slog.Info("another monitor is active and restart flag is false", "socket", monitorLock.SocketPath(), "err", err)
+			return true, os.ErrExist
+		}
+		return false, nil // my ancestor has the lock
+	}
+
+	if !selfMonitor && v.Restart {
+		// Check and stop self-monitor if any is already running.
+		if closef, err := monitorLock.TryLock(ctx); err == nil {
+			closef()
+			return false, nil
+		}
+		if err := monitorLock.CheckAncestor(ctx); err != nil {
+			closef, err := monitorLock.Lock(ctx, true /* shutdown */)
+			if err != nil {
+				slog.Warn("could not shutdown existing monitor", "socket", monitorLock.SocketPath(), "err", err)
+				return true, err
+			}
+			closef()
+		}
+		return false, nil // my ancestor has the lock
+	}
+
+	if selfMonitor && !v.Restart {
+		closef, err := monitorLock.TryLock(ctx)
+		if err != nil {
+			slog.Warn("could not acquire self-monitoring lock and restart flag is false", "err", err)
+			return true, err
+		}
+		defer closef()
+	}
+
+	if selfMonitor && v.Restart {
+		closef, err := monitorLock.Lock(ctx, true /* shutdown */)
+		if err != nil {
+			slog.Warn("could not acquire self-monitor lock with shutdown message", "err", err)
+			return true, err
+		}
+		defer closef()
+	}
+
+	ctx, err := unixlock.WithLock(ctx, monitorLock)
+	if err != nil {
+		return true, err
+	}
+
+	// Disable -self-monitor flag for the forked children.
+	os.Setenv("RUNCMD_DISABLE_SELFMONITOR_FLAG", "1")
+
+	// Redirect logging if we are NOT running in the foreground.
+	if v.Background && !v.LogToStderr {
+		opts := &sglog.Options{
+			Name:                 v.LogName + "-monitor",
+			LogFileHeader:        true,
+			LogDirs:              []string{v.LogDir},
+			LogFileMaxSize:       100 * 1024 * 1024,
+			LogFileReuseDuration: time.Hour,
+		}
+		backend := sglog.NewBackend(opts)
+		defer backend.Close()
+		slog.Info("self-monitoring logs are written to the logs directory", "logname", opts.Name, "logdir", v.LogDir)
+		slog.SetDefault(slog.New(backend.Handler()))
+	}
+
+	for i := 0; ctx.Err() == nil; i++ {
+		slog.Info("starting a monitored child process", "instance", i)
+		status := v.monitorChild(ctx, monitorLock, backgroundLock, binPath, os.Args[1:])
 		if status != nil {
-			return nil
+			slog.Warn("monitored child process died", "instance", i, "status", status)
+		}
+		if status == nil {
+			slog.Warn("monitored child process quit with success status", "instance", i)
 		}
 
-		// Send monitor logs to a different file -- only after first instance
-		// is successful and background flag is set.
-		if v.Background {
-			if !v.LogToStderr {
-				opts := &sglog.Options{
-					Name:                 v.LogName + "-monitor",
-					LogFileHeader:        true,
-					LogDirs:              []string{v.LogDir},
-					LogFileMaxSize:       100 * 1024 * 1024,
-					LogFileReuseDuration: time.Hour,
-				}
-				backend := sglog.NewBackend(opts)
-				defer backend.Close()
-				slog.Info("self-monitoring logs are written to the logs directory", "logname", opts.Name, "logdir", v.LogDir)
-				slog.SetDefault(slog.New(backend.Handler()))
+		if i == 0 {
+			backgroundLock = nil
+			if status != nil {
+				return true, status // First child failure is reported back to the user.
 			}
 		}
+
+		time.Sleep(50*time.Millisecond + time.Duration(rand.Intn(100))*time.Millisecond)
+	}
+	return true, context.Cause(ctx)
+}
+
+// monitorChild forks a child process and waits for the process to die. Returns
+// the initialization status of the child process.
+//
+// Child process is expected to report it's initialization status and still
+// continue execution.
+//
+// If child process dies without reporting the initialization status, then it's
+// exit status is used as the initialization status.
+//
+// Note that child process may die with unsuccessful exit status, but a
+// successful initialization status, in which case, this method returns nil.
+func (v *RunFlags) monitorChild(ctx context.Context, monitorLock, backgroundLock *unixlock.Mutex, binPath string, args []string) (status error) {
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer func() { cancel(status) }()
+
+	cmd := exec.CommandContext(ctx, binPath, args...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Start(); err != nil {
+		if backgroundLock != nil {
+			unixlock.Report(ctx, backgroundLock, status)
+		}
+		slog.Error("child process command has failed (will retry)", "err", err)
+		return err
+	}
+	slog.Info("started new child process", "pid", cmd.Process.Pid)
+
+	v.wg.Add(1)
+	go func() {
+		childStatus := cmd.Wait()
+		slog.Info("child process has died", "pid", cmd.Process.Pid, "status", childStatus)
+		cancel(childStatus)
+		v.wg.Done()
+	}()
+
+	status = unixlock.WaitForReport(ctx, monitorLock)
+	slog.Info("received initialization-status report from child process", "pid", cmd.Process.Pid, "status", status)
+
+	if backgroundLock != nil {
+		unixlock.Report(ctx, backgroundLock, status)
 	}
 
 	<-ctx.Done()
-	return context.Cause(ctx)
+
+	return status
 }

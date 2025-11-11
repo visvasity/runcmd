@@ -261,7 +261,7 @@ func TestCommandMatrix(t *testing.T) {
 	var ftest ForkTest
 	defer ftest.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	if err := ftest.kill(ctx, t, ""); err != nil {

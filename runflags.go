@@ -36,6 +36,8 @@ type RunFlags struct {
 	// -background=true.
 	LogOptions sglog.Options
 
+	logBackend *sglog.Backend
+
 	// LogDir (-log-dir) holds the preferred directory for log files. Defaults to
 	// a subdirectory named "logs" inside the data directory.
 	LogDir string
@@ -43,6 +45,9 @@ type RunFlags struct {
 	// LogToStderr (-log-to-stderr) when true forces logs to the standard stderr
 	// (including when -background=true) and logs are NOT written to any files.
 	LogToStderr bool
+
+	// LogDebug (-log-debug) when true emits debug log messages.
+	LogDebug bool
 
 	// Restart (-restart) when true, sends shutdown request to service instance
 	// if it is running.
@@ -80,11 +85,20 @@ func (v *RunFlags) FlagSet() *flag.FlagSet {
 	fset.StringVar(&v.DataDir, "data-dir", v.DataDir, "Data directory.")
 	fset.StringVar(&v.LogDir, "log-dir", v.LogDir, "Directory for log files.")
 	fset.BoolVar(&v.LogToStderr, "log-to-stderr", v.LogToStderr, "When true, writes logs to stderr.")
+	fset.BoolVar(&v.LogDebug, "log-debug", false, "when true, debug messages are logged")
 	return fset
 }
 
 func (v *RunFlags) isLogEnabled() bool {
 	return v.Background && !v.LogToStderr
+}
+
+// SetLoggerLevel updates the logging level and returns the current level.
+func (v *RunFlags) SetLoggerLevel(x slog.Level) (old slog.Level) {
+	if v.logBackend != nil {
+		return v.logBackend.SetLevel(x)
+	}
+	return slog.SetLogLoggerLevel(x)
 }
 
 func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
@@ -185,10 +199,13 @@ func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
 
 	// Redirect logging if we are NOT running in the foreground.
 	if v.isLogEnabled() {
-		backend := sglog.NewBackend(&v.LogOptions)
-		defer backend.Close()
+		v.logBackend = sglog.NewBackend(&v.LogOptions)
+		defer v.logBackend.Close()
+		if v.LogDebug {
+			v.logBackend.SetLevel(slog.LevelDebug)
+		}
 		slog.Info("service logs are written to the logs directory", "log-name", v.LogOptions.Name, "log-dirs", v.LogOptions.LogDirs)
-		slog.SetDefault(slog.New(backend.Handler()))
+		slog.SetDefault(slog.New(v.logBackend.Handler()))
 	}
 
 	v.reportf = func(status error) {
@@ -364,6 +381,9 @@ func (v *RunFlags) handleSelfMonitorFlag(ctx context.Context, backgroundLock, mo
 		opts.Name += "-monitor"
 		backend := sglog.NewBackend(&opts)
 		defer backend.Close()
+		if v.LogDebug {
+			backend.SetLevel(slog.LevelDebug)
+		}
 		slog.Info("self-monitoring logs are written to the logs directory", "log-name", opts.Name, "log-dirs", v.LogOptions.LogDirs)
 		slog.SetDefault(slog.New(backend.Handler()))
 	}

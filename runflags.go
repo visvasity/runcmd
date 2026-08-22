@@ -296,7 +296,7 @@ func (v *RunFlags) handleBackgroundFlag(ctx context.Context, backgroundLock *uni
 	if status == nil {
 		slog.Info("background process is initialized successfully", "pid", cmd.Process.Pid)
 	} else {
-		slog.Info("background process has failed to initialize", "pid", cmd.Process.Pid, "status", status)
+		slog.Error("background process has failed to initialize", "pid", cmd.Process.Pid, "status", status)
 	}
 
 	return true, status // End of the foreground process.

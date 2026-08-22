@@ -22,8 +22,8 @@ import (
 	"time"
 
 	"github.com/visvasity/cli"
+	"github.com/visvasity/runcmd/unixlock"
 	"github.com/visvasity/sglog"
-	"github.com/visvasity/unixlock"
 )
 
 type RunFlags struct {
@@ -177,7 +177,7 @@ func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
 	serviceSock := filepath.Join(v.DataDir, "service.sock")
 	serviceLock := unixlock.New(serviceSock)
 
-	closef, err := serviceLock.TryLock(ctx)
+	closef, _, err := serviceLock.TryLock(ctx)
 	if err != nil {
 		if !v.Restart {
 			slog.Error("could not acquire service socket file and restart flag is false", "socket", serviceSock, "err", err)
@@ -321,7 +321,7 @@ func (v *RunFlags) handleSelfMonitorFlag(ctx context.Context, backgroundLock, mo
 
 	if !selfMonitor && !v.Restart {
 		// Ensure that no self-monitored instance is running.
-		if closef, err := monitorLock.TryLock(ctx); err == nil {
+		if closef, _, err := monitorLock.TryLock(ctx); err == nil {
 			closef()
 			return false, nil
 		}
@@ -334,7 +334,7 @@ func (v *RunFlags) handleSelfMonitorFlag(ctx context.Context, backgroundLock, mo
 
 	if !selfMonitor && v.Restart {
 		// Check and stop self-monitor if any is already running.
-		if closef, err := monitorLock.TryLock(ctx); err == nil {
+		if closef, _, err := monitorLock.TryLock(ctx); err == nil {
 			closef()
 			return false, nil
 		}
@@ -350,7 +350,7 @@ func (v *RunFlags) handleSelfMonitorFlag(ctx context.Context, backgroundLock, mo
 	}
 
 	if selfMonitor && !v.Restart {
-		closef, err := monitorLock.TryLock(ctx)
+		closef, _, err := monitorLock.TryLock(ctx)
 		if err != nil {
 			slog.Warn("could not acquire self-monitoring lock and restart flag is false", "err", err)
 			return true, err

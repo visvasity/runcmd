@@ -446,7 +446,13 @@ func (m *Mutex) Lock(ctx context.Context, shutdown bool) (unlockf func(), status
 		// If this Mutex itself already holds the lock, waiting is pointless and a
 		// shutdown request would target ourselves; fail fast. Likewise fail fast
 		// when the owner cannot be determined.
-		if m.listener.Load() != nil || owner <= 0 {
+		if m.listener.Load() != nil {
+			return nil, err
+		}
+		if owner <= 0 {
+			if _, err := m.sendCmd(ctx, "getpid"); lockIsFree(err) {
+				continue
+			}
 			return nil, err
 		}
 		// A distinct incumbent holds the lock (possibly another instance in this

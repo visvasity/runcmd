@@ -22,7 +22,9 @@ type TestRunCmd struct {
 }
 
 func (c *TestRunCmd) Command() (string, *flag.FlagSet, cli.CmdFunc) {
-	return "run", c.RunFlags.FlagSet(), c.RunFlags.WithRunFunc(c.runner)
+	fset := new(flag.FlagSet)
+	c.RunFlags.SetFlags(fset, nil)
+	return "run", fset, c.RunFlags.WithRunFunc(c.runner)
 }
 
 func TestBasicGoodRun(t *testing.T) {

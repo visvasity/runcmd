@@ -52,7 +52,8 @@ func (c *ExampleRunCmd) Purpose() string {
 }
 
 func (c *ExampleRunCmd) Command() (string, *flag.FlagSet, cli.CmdFunc) {
-	fset := c.RunFlags.FlagSet()
+	fset := new(flag.FlagSet)
+	c.RunFlags.SetFlags(fset, nil)
 	fset.DurationVar(&c.RunTime, "run-time", time.Millisecond, "Amount of time to run")
 	fset.BoolVar(&c.Fail, "fail", false, "When true, subcommand is made to fail to start")
 	fset.BoolVar(&c.FailWithReport, "fail-with-report", true, "When false, subcommand is made to die silently")

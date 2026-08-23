@@ -76,9 +76,23 @@ func (v *RunFlags) WithRunFunc(f cli.CmdFunc) cli.CmdFunc {
 	return v.run
 }
 
-// FlagSet allocates a new flag.FlagSet object and configures it with the run flags.
-func (v *RunFlags) FlagSet() *flag.FlagSet {
-	fset := new(flag.FlagSet)
+// // FlagSet allocates a new flag.FlagSet object and configures it with the run flags.
+// func (v *RunFlags) FlagSet() *flag.FlagSet {
+// 	fset := new(flag.FlagSet)
+// 	fset.BoolVar(&v.Restart, "restart", v.Restart, "When true, shutdowns existing service.")
+// 	fset.BoolVar(&v.Background, "background", v.Background, "When true, runs as a background daemon.")
+// 	fset.BoolVar(&v.SelfMonitor, "self-monitor", v.SelfMonitor, "When true, auto restarts background service.")
+// 	fset.StringVar(&v.DataDir, "data-dir", v.DataDir, "Data directory.")
+// 	fset.StringVar(&v.LogDir, "log-dir", v.LogDir, "Directory for log files.")
+// 	fset.BoolVar(&v.LogToStderr, "log-to-stderr", v.LogToStderr, "When true, writes logs to stderr.")
+// 	fset.BoolVar(&v.LogDebug, "log-debug", false, "when true, debug messages are logged")
+// 	return fset
+// }
+
+func (v *RunFlags) SetFlags(fset *flag.FlagSet, defaults *RunFlags) {
+	if defaults == nil {
+		defaults = v
+	}
 	fset.BoolVar(&v.Restart, "restart", v.Restart, "When true, shutdowns existing service.")
 	fset.BoolVar(&v.Background, "background", v.Background, "When true, runs as a background daemon.")
 	fset.BoolVar(&v.SelfMonitor, "self-monitor", v.SelfMonitor, "When true, auto restarts background service.")
@@ -86,7 +100,6 @@ func (v *RunFlags) FlagSet() *flag.FlagSet {
 	fset.StringVar(&v.LogDir, "log-dir", v.LogDir, "Directory for log files.")
 	fset.BoolVar(&v.LogToStderr, "log-to-stderr", v.LogToStderr, "When true, writes logs to stderr.")
 	fset.BoolVar(&v.LogDebug, "log-debug", false, "when true, debug messages are logged")
-	return fset
 }
 
 func (v *RunFlags) isLogEnabled() bool {

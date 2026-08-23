@@ -51,7 +51,8 @@ func (c *RunCmdExample) Purpose() string {
 }
 
 func (c *RunCmdExample) Command() (string, *flag.FlagSet, cli.CmdFunc) {
-	fset := c.RunFlags.FlagSet()
+	fset := new(flag.FlagSet)
+	c.RunFlags.SetFlags(fset, nil)
 	fset.DurationVar(&c.RunTime, "run-time", time.Hour, "When non-zero, run will die after the timeout")
 	fset.BoolVar(&c.FailRandomly, "fail-randomly", false, "When true, run is made to fail to start")
 	return "run", fset, c.RunFlags.WithRunFunc(c.run)

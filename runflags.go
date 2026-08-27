@@ -1,8 +1,8 @@
 // Copyright (c) 2025 Visvasity LC
 
-// Package runcmd handles the logic for command-line flags --data-dir,
-// --background, --restart, --self-monitor, and logging so that, different
-// daemons can reuse this functionality without duplication.
+// Package runcmd handles the logic for command-line flags --background,
+// --restart, --self-monitor, and logging so that, different daemons can reuse
+// this functionality without duplication.
 package runcmd
 
 import (
@@ -21,33 +21,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/visvasity/cli"
 	"github.com/visvasity/runcmd/unixlock"
-	"github.com/visvasity/sglog"
 )
 
+type RunFunc = func(context.Context, []string) error
+
 type RunFlags struct {
-	// DataDir (-data-dir) holds the data directory for the service. Defaults to
+	// LocksDir (-locks-dir) holds the lock files for the service. Defaults to
 	// os.TempDir.
-	DataDir string
-
-	// LogOptions allows for customizing logging. By default, logs are written to
-	// stderr when -background=false and redirected to files when
-	// -background=true.
-	LogOptions sglog.Options
-
-	logBackend *sglog.Backend
-
-	// LogDir (-log-dir) holds the preferred directory for log files. Defaults to
-	// a subdirectory named "logs" inside the data directory.
-	LogDir string
-
-	// LogToStderr (-log-to-stderr) when true forces logs to the standard stderr
-	// (including when -background=true) and logs are NOT written to any files.
-	LogToStderr bool
-
-	// LogDebug (-log-debug) when true emits debug log messages.
-	LogDebug bool
+	LocksDir string
 
 	// Restart (-restart) when true, sends shutdown request to service instance
 	// if it is running.
@@ -61,57 +43,29 @@ type RunFlags struct {
 
 	wg sync.WaitGroup
 
-	main cli.CmdFunc
+	main RunFunc
 
 	// reportf is a helper function that sends init status to the monitor/daemon
 	// process.
 	reportf func(error)
 }
 
-// WithRunFunc returns cli.CmdFunc that will first process background, restart,
+// WithRunFunc returns RunFunc that will first process background, restart,
 // self-monitor, etc. runcmd package flags and then delegates control to the
 // given user-defined function.
-func (v *RunFlags) WithRunFunc(f cli.CmdFunc) cli.CmdFunc {
+func (v *RunFlags) WithRunFunc(f RunFunc) RunFunc {
 	v.main = f
 	return v.run
 }
-
-// // FlagSet allocates a new flag.FlagSet object and configures it with the run flags.
-// func (v *RunFlags) FlagSet() *flag.FlagSet {
-// 	fset := new(flag.FlagSet)
-// 	fset.BoolVar(&v.Restart, "restart", v.Restart, "When true, shutdowns existing service.")
-// 	fset.BoolVar(&v.Background, "background", v.Background, "When true, runs as a background daemon.")
-// 	fset.BoolVar(&v.SelfMonitor, "self-monitor", v.SelfMonitor, "When true, auto restarts background service.")
-// 	fset.StringVar(&v.DataDir, "data-dir", v.DataDir, "Data directory.")
-// 	fset.StringVar(&v.LogDir, "log-dir", v.LogDir, "Directory for log files.")
-// 	fset.BoolVar(&v.LogToStderr, "log-to-stderr", v.LogToStderr, "When true, writes logs to stderr.")
-// 	fset.BoolVar(&v.LogDebug, "log-debug", false, "when true, debug messages are logged")
-// 	return fset
-// }
 
 func (v *RunFlags) SetFlags(fset *flag.FlagSet, defaults *RunFlags) {
 	if defaults == nil {
 		defaults = v
 	}
+	fset.StringVar(&v.LocksDir, "locks-dir", v.LocksDir, "Path to a directory for the lock files.")
 	fset.BoolVar(&v.Restart, "restart", v.Restart, "When true, shutdowns existing service.")
 	fset.BoolVar(&v.Background, "background", v.Background, "When true, runs as a background daemon.")
 	fset.BoolVar(&v.SelfMonitor, "self-monitor", v.SelfMonitor, "When true, auto restarts background service.")
-	fset.StringVar(&v.DataDir, "data-dir", v.DataDir, "Data directory.")
-	fset.StringVar(&v.LogDir, "log-dir", v.LogDir, "Directory for log files.")
-	fset.BoolVar(&v.LogToStderr, "log-to-stderr", v.LogToStderr, "When true, writes logs to stderr.")
-	fset.BoolVar(&v.LogDebug, "log-debug", false, "when true, debug messages are logged")
-}
-
-func (v *RunFlags) isLogEnabled() bool {
-	return v.Background && !v.LogToStderr
-}
-
-// SetLoggerLevel updates the logging level and returns the current level.
-func (v *RunFlags) SetLoggerLevel(x slog.Level) (old slog.Level) {
-	if v.logBackend != nil {
-		return v.logBackend.SetLevel(x)
-	}
-	return slog.SetLogLoggerLevel(x)
 }
 
 func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
@@ -137,88 +91,53 @@ func (v *RunFlags) run(ctx context.Context, args []string) (status error) {
 		return fmt.Errorf("failed to lookup binary: %w", err)
 	}
 
-	if v.DataDir == "" {
-		v.DataDir = os.TempDir()
+	if v.LocksDir == "" {
+		v.LocksDir = os.TempDir()
 	}
-	if _, err := os.Stat(v.DataDir); err != nil {
+	if _, err := os.Stat(v.LocksDir); err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("could not stat data dir %q: %w", v.DataDir, err)
+			return fmt.Errorf("could not stat locks dir %q: %w", v.LocksDir, err)
 		}
-		if err := os.MkdirAll(v.DataDir, os.FileMode(0700)); err != nil {
-			return fmt.Errorf("could not create data dir %q: %w", v.DataDir, err)
-		}
-	}
-
-	// Default logging options.
-	if v.isLogEnabled() {
-		if v.LogOptions.Name == "" {
-			v.LogOptions.Name = filepath.Base(binaryPath)
-		}
-		if len(v.LogOptions.LogDirs) == 0 || v.LogDir != "" {
-			logDir := filepath.Join(v.DataDir, "logs")
-			if v.LogDir != "" {
-				logDir = v.LogDir
-			}
-			if stat, err := os.Stat(logDir); err != nil {
-				if !errors.Is(err, os.ErrNotExist) {
-					return fmt.Errorf("could not stat logs dir %q: %w", logDir, err)
-				}
-				if err := os.MkdirAll(logDir, os.FileMode(0700)); err != nil {
-					return fmt.Errorf("could not create logs dir %q: %w", logDir, err)
-				}
-			} else if !stat.IsDir() {
-				return fmt.Errorf("log directory value %q is not a directory", logDir)
-			}
-			v.LogOptions.LogDirs = append([]string{logDir}, v.LogOptions.LogDirs...)
+		if err := os.MkdirAll(v.LocksDir, os.FileMode(0700)); err != nil {
+			return fmt.Errorf("could not create locks dir %q: %w", v.LocksDir, err)
 		}
 	}
 
-	backgroundSock := filepath.Join(v.DataDir, "daemon.sock")
+	backgroundSock := filepath.Join(v.LocksDir, "daemon.sock")
 	backgroundLock := unixlock.New(backgroundSock)
 	if quit, status := v.handleBackgroundFlag(ctx, backgroundLock, binaryPath); quit {
 		return status
 	}
 	defer func() { unixlock.Report(ctx, backgroundLock, status) }()
 
-	monitorSock := filepath.Join(v.DataDir, "monitor.sock")
+	monitorSock := filepath.Join(v.LocksDir, "monitor.sock")
 	monitorLock := unixlock.New(monitorSock)
 	if quit, status := v.handleSelfMonitorFlag(ctx, backgroundLock, monitorLock, binaryPath); quit {
 		return status
 	}
 	defer func() { unixlock.Report(ctx, monitorLock, status) }()
 
-	serviceSock := filepath.Join(v.DataDir, "service.sock")
+	serviceSock := filepath.Join(v.LocksDir, "service.sock")
 	serviceLock := unixlock.New(serviceSock)
 
 	closef, _, err := serviceLock.TryLock(ctx)
 	if err != nil {
 		if !v.Restart {
-			slog.Error("could not acquire service socket file and restart flag is false", "socket", serviceSock, "err", err)
+			slog.Error("service: could not acquire service socket file and restart flag is false", "socket", serviceSock, "err", err)
 			return fmt.Errorf("another instance of the service is running (restart flag is false): %w", err)
 		}
-		slog.Debug("acquiring service socket file with a shutdown message", "socket", serviceSock)
+		slog.Debug("service: acquiring service socket file with a shutdown message", "socket", serviceSock)
 		closef, err = serviceLock.Lock(ctx, true /* force */)
 		if err != nil {
 			return fmt.Errorf("could not acquire service lock with shutdown message: %w", err)
 		}
-		slog.Info("acquired service socket file through a shutdown message", "socket", serviceSock)
+		slog.Info("service: acquired service socket file through a shutdown message", "socket", serviceSock)
 	}
 	defer closef()
 
 	ctx, err = unixlock.WithLock(ctx, serviceLock)
 	if err != nil {
 		return err
-	}
-
-	// Redirect logging if we are NOT running in the foreground.
-	if v.isLogEnabled() {
-		v.logBackend = sglog.NewBackend(&v.LogOptions)
-		defer v.logBackend.Close()
-		if v.LogDebug {
-			v.logBackend.SetLevel(slog.LevelDebug)
-		}
-		slog.Info("service logs are written to the logs directory", "log-name", v.LogOptions.Name, "log-dirs", v.LogOptions.LogDirs)
-		slog.SetDefault(slog.New(v.logBackend.Handler()))
 	}
 
 	v.reportf = func(status error) {
@@ -259,7 +178,7 @@ func (v *RunFlags) handleBackgroundFlag(ctx context.Context, backgroundLock *uni
 	}
 	defer closef()
 
-	slog.Info("daemonize lock file is acquired/created successfully", "socket", backgroundLock.SocketPath())
+	slog.Info("foreground: daemonize lock file is acquired/created successfully", "socket", backgroundLock.SocketPath())
 
 	// Disable the -background flag for the forked-child instance and all it's
 	// descendants.
@@ -287,20 +206,20 @@ func (v *RunFlags) handleBackgroundFlag(ctx context.Context, backgroundLock *uni
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setsid: true,
 	}
-	if v.LogToStderr {
-		cmd.Stderr = os.Stderr
-	}
+	// if v.LogToStderr {
+	// 	cmd.Stderr = os.Stderr
+	// }
 
 	if err := cmd.Start(); err != nil {
-		slog.Error("could not start background process", "err", err)
+		slog.Error("foreground: could not start background process", "err", err)
 		return true, err
 	}
-	slog.Info("started new background process", "pid", cmd.Process.Pid)
+	slog.Info("foreground: started new background process", "pid", cmd.Process.Pid)
 
 	v.wg.Add(1)
 	go func() {
 		childStatus := cmd.Wait()
-		slog.Info("background process has died", "pid", cmd.Process.Pid, "status", childStatus)
+		slog.Info("foreground: background process has died", "pid", cmd.Process.Pid, "status", childStatus)
 		cancel(childStatus)
 		v.wg.Done()
 	}()
@@ -339,7 +258,7 @@ func (v *RunFlags) handleSelfMonitorFlag(ctx context.Context, backgroundLock, mo
 			return false, nil
 		}
 		if err := monitorLock.CheckAncestor(ctx); err != nil {
-			slog.Info("another monitor is active and restart flag is false", "socket", monitorLock.SocketPath(), "err", err)
+			slog.Info("monitor: another monitor is active and restart flag is false", "socket", monitorLock.SocketPath(), "err", err)
 			return true, os.ErrExist
 		}
 		return false, nil // my ancestor has the lock
@@ -354,7 +273,7 @@ func (v *RunFlags) handleSelfMonitorFlag(ctx context.Context, backgroundLock, mo
 		if err := monitorLock.CheckAncestor(ctx); err != nil {
 			closef, err := monitorLock.Lock(ctx, true /* shutdown */)
 			if err != nil {
-				slog.Warn("could not shutdown existing monitor", "socket", monitorLock.SocketPath(), "err", err)
+				slog.Warn("monitor: could not shutdown existing monitor", "socket", monitorLock.SocketPath(), "err", err)
 				return true, err
 			}
 			closef()
@@ -365,7 +284,7 @@ func (v *RunFlags) handleSelfMonitorFlag(ctx context.Context, backgroundLock, mo
 	if selfMonitor && !v.Restart {
 		closef, _, err := monitorLock.TryLock(ctx)
 		if err != nil {
-			slog.Warn("could not acquire self-monitoring lock and restart flag is false", "err", err)
+			slog.Warn("monitor: could not acquire self-monitoring lock and restart flag is false", "err", err)
 			return true, err
 		}
 		defer closef()
@@ -374,7 +293,7 @@ func (v *RunFlags) handleSelfMonitorFlag(ctx context.Context, backgroundLock, mo
 	if selfMonitor && v.Restart {
 		closef, err := monitorLock.Lock(ctx, true /* shutdown */)
 		if err != nil {
-			slog.Warn("could not acquire self-monitor lock with shutdown message", "err", err)
+			slog.Warn("monitor: could not acquire self-monitor lock with shutdown message", "err", err)
 			return true, err
 		}
 		defer closef()
@@ -388,27 +307,14 @@ func (v *RunFlags) handleSelfMonitorFlag(ctx context.Context, backgroundLock, mo
 	// Disable -self-monitor flag for the forked children.
 	os.Setenv("RUNCMD_DISABLE_SELFMONITOR_FLAG", "1")
 
-	// Redirect logging if we are NOT running in the foreground.
-	if v.Background && !v.LogToStderr {
-		opts := v.LogOptions
-		opts.Name += "-monitor"
-		backend := sglog.NewBackend(&opts)
-		defer backend.Close()
-		if v.LogDebug {
-			backend.SetLevel(slog.LevelDebug)
-		}
-		slog.Info("self-monitoring logs are written to the logs directory", "log-name", opts.Name, "log-dirs", v.LogOptions.LogDirs)
-		slog.SetDefault(slog.New(backend.Handler()))
-	}
-
 	for i := 0; ctx.Err() == nil; i++ {
-		slog.Info("starting a monitored child process", "instance", i)
+		slog.Info("monitor: starting a monitored child process", "instance", i)
 		status := v.monitorChild(ctx, monitorLock, backgroundLock, binPath, os.Args[1:])
 		if status != nil {
-			slog.Warn("monitored child process died", "instance", i, "status", status)
+			slog.Warn("monitor: monitored child process died", "instance", i, "status", status)
 		}
 		if status == nil {
-			slog.Warn("monitored child process quit with success status", "instance", i)
+			slog.Warn("monitor: monitored child process quit with success status", "instance", i)
 		}
 
 		if i == 0 {
@@ -444,21 +350,21 @@ func (v *RunFlags) monitorChild(ctx context.Context, monitorLock, backgroundLock
 		if backgroundLock != nil {
 			unixlock.Report(ctx, backgroundLock, status)
 		}
-		slog.Error("child process command has failed (will retry)", "err", err)
+		slog.Error("monitor: child process command has failed (will retry)", "err", err)
 		return err
 	}
-	slog.Info("started new child process", "pid", cmd.Process.Pid)
+	slog.Info("monitor: started new child process", "pid", cmd.Process.Pid)
 
 	v.wg.Add(1)
 	go func() {
 		childStatus := cmd.Wait()
-		slog.Info("child process has died", "pid", cmd.Process.Pid, "status", childStatus)
+		slog.Info("monitor: child process has died", "pid", cmd.Process.Pid, "status", childStatus)
 		cancel(childStatus)
 		v.wg.Done()
 	}()
 
 	status = unixlock.WaitForReport(ctx, monitorLock)
-	slog.Info("received initialization-status report from child process", "pid", cmd.Process.Pid, "status", status)
+	slog.Info("monitor: received initialization-status report from child process", "pid", cmd.Process.Pid, "status", status)
 
 	if backgroundLock != nil {
 		unixlock.Report(ctx, backgroundLock, status)

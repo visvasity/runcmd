@@ -17,17 +17,13 @@ import (
 
 	"github.com/visvasity/cli"
 	"github.com/visvasity/runcmd"
-	"github.com/visvasity/sglog"
 )
 
 func main() {
 	cmds := []cli.Command{
 		&RunCmdExample{
 			RunFlags: runcmd.RunFlags{
-				DataDir: filepath.Join(os.Getenv("HOME"), ".runcmd-example"),
-				LogOptions: sglog.Options{
-					LogFileHeader: true,
-				},
+				LocksDir: filepath.Join(os.Getenv("HOME"), ".runcmd-example"),
 			},
 		},
 	}

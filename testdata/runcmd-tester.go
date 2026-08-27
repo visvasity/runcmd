@@ -18,8 +18,7 @@ func main() {
 	cmds := []cli.Command{
 		&ExampleRunCmd{
 			RunFlags: runcmd.RunFlags{
-				DataDir:     "/tmp/hello",
-				LogToStderr: true,
+				LocksDir: "/tmp/hello",
 			},
 		},
 	}
